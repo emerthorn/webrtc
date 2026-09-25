@@ -26,6 +26,7 @@
 #include <pthread.h>
 
 #include <cerrno>
+#include <unistd.h>
 #ifdef WEBRTC_MAC
 #include <sys/time.h>
 #endif
@@ -176,6 +177,31 @@ bool Event::Wait(TimeDelta give_up_after, TimeDelta warn_after) {
         error =
             pthread_cond_timedwait(&event_cond_, &event_mutex_, &*timeout_ts);
 #endif
+      }
+    }
+    // VeilMesh (CF-218): on Apple the kernel can answer a perfectly valid
+    // condition variable with EINVAL — seen on the main thread of an iOS app,
+    // where the stack slot of a fresh Event is still known to the kernel as a
+    // busy synchronizer of another type. Treating that as "signaled" lets
+    // Thread::BlockingCall return before its task ran, and the task later
+    // writes into a dead stack frame. The event has not been set, so keep
+    // waiting by polling the flag under the mutex until it is set or the
+    // deadline passes.
+    if (error != 0 && error != ETIMEDOUT) {
+      error = 0;
+      while (!event_status_) {
+        if (timeout_ts != std::nullopt) {
+          const timespec now = GetTimespec(TimeDelta::Zero());
+          if (now.tv_sec > timeout_ts->tv_sec ||
+              (now.tv_sec == timeout_ts->tv_sec &&
+               now.tv_nsec >= timeout_ts->tv_nsec)) {
+            error = ETIMEDOUT;
+            break;
+          }
+        }
+        pthread_mutex_unlock(&event_mutex_);
+        usleep(1000);
+        pthread_mutex_lock(&event_mutex_);
       }
     }
     return error;
